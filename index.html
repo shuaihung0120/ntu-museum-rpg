@@ -924,7 +924,7 @@
 
     async function fetchAllTeamsFromCloud(showSuccessToast = false) {
       try {
-        const url = `${FIRESTORE_REST_BASE}/${TEAMS_COLLECTION}?pageSize=100&_t=${Date.now()}`;
+        const url = `${FIRESTORE_REST_BASE}/${TEAMS_COLLECTION}?pageSize=100`;
         const res = await fetch(url, { method: 'GET', cache: 'no-store' });
         if (!res.ok) {
           const errJson = await res.json().catch(() => ({}));
