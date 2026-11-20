@@ -678,19 +678,18 @@
           },
           {
             id: 'her_2',
-            type: 'choice',
-            titleZh: '第 2 題｜探險家的植物標本夾',
-            titleJa: '第2問｜植物採集家の野外道具',
-            promptZh: '觀察早期植物學家野外採集工具箱，木製格子狀的「野外標本夾（Plant Press）」主要功能是什麼？',
-            promptJa: '初期の植物学者が使った格子状の木製「野冊（標本挟み）」の主な役割は何ですか？',
-            options: [
-              { val: 'press_dry', labelZh: 'A. 夾平新鮮植物並搭配吸水紙壓乾，防止葉片捲曲發霉', labelJa: 'A. 採集した植物を吸水紙に挟んで圧迫・乾燥させ、縮みやカビを防ぐ' },
-              { val: 'catch_bug', labelZh: 'B. 當作捕蟲網捕捉蝴蝶', labelJa: 'B. 蝶を捕まえる虫取り網として使う' },
-              { val: 'measure_rain', labelZh: 'C. 測量高山降雨量', labelJa: 'C. 高山の降水量を測る' }
-            ],
-            answers: ['press_dry'],
-            hintZh: '野外採下的植物若不立刻用標本夾與吸水紙壓平，很快就會枯萎捲曲無法辨認特徵。',
-            hintJa: '採集した植物はすぐに標本挟みと吸水紙で平らに圧迫しないと、丸まって特徴が分からなくなってしまいます。'
+            type: 'text',
+            titleZh: '第 2 題｜民俗植物工藝：傳統小掃把',
+            titleJa: '第2問｜民俗植物工芸：伝統のミニほうき',
+            image: 'IMG_20261002_150929_117_01_17.jpeg',
+            imageCaptionZh: '民俗植物展區實物：傳統手工小掃把（點擊圖片可放大）',
+            promptZh: '請在「民俗植物」展區找出如圖所示的傳統手工「小掃把」，請問它是利用台灣山野常見的哪一種植物（花穗）綁製而成的？（請輸入植物名稱，如：芒草）',
+            promptJa: '「民俗植物」展示コーナーで写真のような伝統的な「ミニほうき」を探しましょう。これは台湾の山野でよく見られるどの植物の穂を束ねて作られていますか？（植物名を入力：例 ススキ / 芒草）',
+            placeholderZh: '輸入植物名稱（例：芒草）',
+            placeholderJa: '植物名を入力（例：ススキ / 芒草）',
+            answers: ['芒草', '芒', '五節芒', '白背芒', '台灣芒', '臺灣芒', 'ススキ', 'すすき', '薄', 'miscanthus'],
+            hintZh: '觀察掃把上的吊牌與展區介紹，這是用秋季常見、花穗呈羽毛狀的「芒草」（如五節芒）製成的掃把。',
+            hintJa: 'ほうきの札や展示解説を見てみましょう。秋に羽毛のような穂をつける「ススキ（中国語：芒草）」で作られています。'
           },
           {
             id: 'her_3',
@@ -1626,6 +1625,13 @@
                   <div class="text-xs sm:text-sm text-ink leading-relaxed">
                     ${biText(q.promptZh, q.promptJa, 'p', 'font-medium', 'text-xs text-stone-600 mt-1')}
                   </div>
+
+                  ${q.image ? `
+                    <div class="rounded-xl overflow-hidden border border-stone-300 bg-stone-100">
+                      <img src="${q.image}" onclick="openPhotoZoom('${q.image}', '${escapeHtml(q.imageCaptionZh || q.titleZh)}')" alt="${escapeHtml(q.titleZh)}" class="w-full max-h-60 object-cover cursor-pointer hover:opacity-95 transition" />
+                      ${q.imageCaptionZh ? `<div class="px-3 py-1.5 bg-parchment text-[11px] text-stone-600 flex items-center justify-between"><span><i class="fa-solid fa-magnifying-glass-plus text-brick mr-1"></i>${escapeHtml(q.imageCaptionZh)}</span></div>` : ''}
+                    </div>
+                  ` : ''}
 
                   ${solved ? `
                     <div class="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold flex items-center gap-2">
