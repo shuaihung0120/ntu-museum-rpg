@@ -103,7 +103,7 @@
             <span id="header-shards">0/7</span> 碎片
           </span>
         </div>
-        <button onclick="toggleTimer()" class="flex items-center gap-1.5 bg-white/10 hover:bg-white/20 px-2.5 py-0.5 rounded-full text-goldLight font-mono transition" title="點擊開始/暫停下午 90 分鐘倒數">
+        <button onclick="toggleTimer()" class="flex items-center gap-1.5 bg-white/10 hover:bg-white/20 px-2.5 py-0.5 rounded-full text-goldLight font-mono transition" title="點擊開始/暫停 90 分鐘倒數">
           <i id="timer-icon" class="fa-regular fa-clock"></i>
           <span id="timer-display">90:00</span>
         </button>
@@ -171,7 +171,7 @@
           </select>
         </div>
         <button onclick="saveTeamSettings()" class="w-full py-3 rounded-xl bg-brick hover:bg-brickDark text-white font-bold shadow-md transition">
-          確認儲存 / 保存する
+          確認儲存並啟動倒數 / 保存して開始
         </button>
       </div>
     </div>
@@ -825,13 +825,13 @@
     ];
 
     // =========================================================================
-    // 2. DIRECT FIRESTORE REST API SYNC (BYPASSES GOOGLE SITES IFRAME SANDBOX)
+    // 2. DIRECT FIRESTORE REST API SYNC (WORKS IN GITHUB PAGES & IFRAMES)
     // =========================================================================
     const FIREBASE_PROJECT_ID = "ntumuseum-41e54";
     const FIRESTORE_REST_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents`;
     const TEAMS_COLLECTION = "rpg_teams";
+    const LOCAL_STORAGE_KEY = "ntu_museum_rpg_state_v3";
 
-    // Generate or safely retrieve a session device ID without crashing in restricted iframes
     let sessionDeviceId = 'dev_' + Math.random().toString(36).slice(2, 10);
     try {
       const storedId = localStorage.getItem('ntu_rpg_device_id');
@@ -841,7 +841,7 @@
         localStorage.setItem('ntu_rpg_device_id', sessionDeviceId);
       }
     } catch (e) {
-      // Google Sites sandboxed iframe blocks localStorage; fallback to in-memory ID seamlessly
+      // Fallback to in-memory device ID if storage is restricted
     }
 
     let cloudConnected = false;
@@ -867,11 +867,21 @@
       state.progress[m.id] = {
         solved: {},
         photoData: null,
+        reflection: '',
         completed: false
       };
     });
 
     let timerInterval = null;
+
+    function escapeHtml(str) {
+      return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
 
     function sanitizeDocId(name) {
       return encodeURIComponent(name.trim()).replace(/%/g, '_').slice(0, 120) || sessionDeviceId;
@@ -894,6 +904,7 @@
           shards: { integerValue: String(dataObj.shards || 0) },
           completedIds: { arrayValue: { values: completedValues } },
           photos: { mapValue: { fields: photoFields } },
+          anatomyReflection: { stringValue: String(dataObj.anatomyReflection || '') },
           updatedAt: { stringValue: String(dataObj.updatedAt || '') }
         }
       };
@@ -918,64 +929,65 @@
         shards: Number((f.shards && f.shards.integerValue) || 0),
         completedIds,
         photos,
+        anatomyReflection: (f.anatomyReflection && f.anatomyReflection.stringValue) || '',
         updatedAt: (f.updatedAt && f.updatedAt.stringValue) || ''
       };
     }
 
-    async function fetchAllTeamsFromCloud(showSuccessToast = false) {
-      try {
-        const url = `${FIRESTORE_REST_BASE}/${TEAMS_COLLECTION}?pageSize=100`;
-        const res = await fetch(url, { method: 'GET', cache: 'no-store' });
-        if (!res.ok) {
-          const errJson = await res.json().catch(() => ({}));
-          const msg = (errJson.error && errJson.error.message) || `HTTP ${res.status}`;
-          throw new Error(msg);
-        }
-        const data = await res.json();
-        const docs = data.documents || [];
-        const list = docs.map(decodeFirestoreDoc);
-        list.sort((a, b) => (b.score || 0) - (a.score || 0));
+    // =========================================================================
+    // 3. STATE PERSISTENCE & CLOUD SYNC FUNCTIONS
+    // =========================================================================
+    function calculateStats() {
+      let score = 0;
+      let shards = 0;
+      MUSEUMS.forEach(m => {
+        const p = state.progress[m.id];
+        const solvedCount = Object.keys(p.solved).length;
+        score += solvedCount * 2;
+        if (p.photoData) score += 3;
+        p.completed = (solvedCount === m.questions.length && Boolean(p.photoData));
+        if (p.completed) shards += 1;
+      });
+      return { score, shards };
+    }
 
-        state.allTeamsBoard = list;
-        cloudConnected = true;
-        cloudErrorMsg = '';
-        cloudStatusText = `雲端已直連（目前共 ${list.length} 組資料）`;
-
-        if (state.currentView === 'teacher' && state.teacherAuthenticated) {
-          render();
-        }
-        if (showSuccessToast) {
-          showToast(`已同步雲端 ${list.length} 組進度`, `クラウドから${list.length}チームのデータを取得しました`, 'success');
-        }
-      } catch (err) {
-        cloudConnected = false;
-        cloudErrorMsg = `連線受阻：${err.message}`;
-        cloudStatusText = '雲端連線異常';
-        if (state.currentView === 'teacher' && state.teacherAuthenticated) {
-          render();
-        }
-        if (showSuccessToast) {
-          showToast('讀取雲端失敗，請檢查 Firestore 規則設定', '読み込み失敗', 'error');
-        }
+    function updateHeaderStats() {
+      const stats = calculateStats();
+      const scoreEl = document.getElementById('header-score');
+      const shardsEl = document.getElementById('header-shards');
+      const teamEl = document.getElementById('header-team-name');
+      if (scoreEl) scoreEl.textContent = stats.score;
+      if (shardsEl) shardsEl.textContent = `${stats.shards}/${MUSEUMS.length}`;
+      if (teamEl) {
+        teamEl.textContent = state.teamName.trim()
+          ? `${state.teamName} (${state.morningGroup}組)`
+          : '點擊設定小隊名稱';
       }
     }
 
     async function saveAndSyncState() {
-      // Save backup to localStorage if allowed by host environment
+      // 1. Save backup to localStorage
       try {
-        localStorage.setItem('ntu_rpg_backup_v2', JSON.stringify({
+        const backupPayload = {
           langMode: state.langMode,
           teamName: state.teamName,
           morningGroup: state.morningGroup,
           startMuseum: state.startMuseum,
           timerSeconds: state.timerSeconds,
           progress: state.progress
-        }));
-      } catch (e) {}
+        };
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(backupPayload));
+      } catch (e) {
+        // Ignore storage quota or sandbox errors
+      }
 
+      // 2. Sync to Firestore REST API
       const stats = calculateStats();
+      const anatomyReflectionText = (state.progress.anatomy && state.progress.anatomy.reflection)
+        ? state.progress.anatomy.reflection.trim()
+        : '';
       const hasNamedTeam = Boolean(state.teamName.trim());
-      if (!hasNamedTeam && stats.score === 0) return;
+      if (!hasNamedTeam && stats.score === 0 && !anatomyReflectionText) return;
 
       const photos = {};
       MUSEUMS.forEach(m => {
@@ -995,6 +1007,7 @@
         shards: stats.shards,
         completedIds: MUSEUMS.filter(m => state.progress[m.id].completed).map(m => m.id),
         photos,
+        anatomyReflection: anatomyReflectionText,
         updatedAt: new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
       });
 
@@ -1006,67 +1019,86 @@
         });
         if (!res.ok) {
           const errJson = await res.json().catch(() => ({}));
-          const msg = (errJson.error && errJson.error.message) || `HTTP ${res.status}`;
-          throw new Error(msg);
-        }
-        cloudConnected = true;
-        cloudErrorMsg = '';
-
-        // If user just set an official name, clean up temporary anonymous record
-        if (hasNamedTeam) {
-          fetch(`${FIRESTORE_REST_BASE}/${TEAMS_COLLECTION}/temp_${sessionDeviceId}`, { method: 'DELETE' }).catch(() => {});
+          cloudConnected = false;
+          cloudErrorMsg = (errJson.error && errJson.error.message) || `HTTP ${res.status}`;
+        } else {
+          cloudConnected = true;
+          cloudErrorMsg = '';
         }
       } catch (err) {
-        cloudErrorMsg = `上傳失敗：${err.message}`;
+        cloudConnected = false;
+        cloudErrorMsg = err.message || '網路連線中斷';
       }
     }
 
     function restoreLocalBackupIfAvailable() {
       try {
-        const raw = localStorage.getItem('ntu_rpg_backup_v2');
+        const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
         if (!raw) return;
         const parsed = JSON.parse(raw);
-        state.langMode = parsed.langMode || 'both';
-        state.teamName = parsed.teamName || '';
-        state.morningGroup = parsed.morningGroup || 'A';
-        state.startMuseum = parsed.startMuseum || 'history';
-        if (typeof parsed.timerSeconds === 'number') state.timerSeconds = parsed.timerSeconds;
+        if (parsed.langMode) state.langMode = parsed.langMode;
+        if (parsed.teamName) state.teamName = parsed.teamName;
+        if (parsed.morningGroup) state.morningGroup = parsed.morningGroup;
+        if (parsed.startMuseum) state.startMuseum = parsed.startMuseum;
+        if (typeof parsed.timerSeconds === 'number' && parsed.timerSeconds > 0) {
+          state.timerSeconds = parsed.timerSeconds;
+        }
         if (parsed.progress) {
           MUSEUMS.forEach(m => {
             if (parsed.progress[m.id]) {
               state.progress[m.id] = {
                 solved: parsed.progress[m.id].solved || {},
                 photoData: parsed.progress[m.id].photoData || null,
+                reflection: parsed.progress[m.id].reflection || '',
                 completed: Boolean(parsed.progress[m.id].completed)
               };
             }
           });
         }
-      } catch (e) {}
+        applyLangButtonUI();
+        updateTimerDisplay();
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+
+    async function fetchAllTeamsFromCloud(manual = false) {
+      try {
+        const res = await fetch(`${FIRESTORE_REST_BASE}/${TEAMS_COLLECTION}?pageSize=100`, {
+          method: 'GET',
+          cache: 'no-store'
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          cloudConnected = false;
+          cloudErrorMsg = (data.error && data.error.message) || `HTTP ${res.status}`;
+          cloudStatusText = '雲端連線異常';
+          if (state.currentView === 'teacher') render();
+          return;
+        }
+
+        cloudConnected = true;
+        cloudErrorMsg = '';
+        const docs = data.documents || [];
+        state.allTeamsBoard = docs.map(decodeFirestoreDoc);
+        cloudStatusText = `雲端已直連（目前共 ${state.allTeamsBoard.length} 組資料）`;
+
+        if (manual) {
+          showToast(`已刷新！共讀取 ${state.allTeamsBoard.length} 組進度`, 'クラウドデータを更新しました！', 'success');
+        }
+        if (state.currentView === 'teacher') render();
+      } catch (err) {
+        cloudConnected = false;
+        cloudErrorMsg = err.message || '無法連線至伺服器';
+        cloudStatusText = '雲端連線異常';
+        if (state.currentView === 'teacher') render();
+      }
     }
 
     // =========================================================================
-    // 3. UTILITIES: NORMALIZATION, AUDIO, TOAST, BILINGUAL HELPER
+    // 4. UI HELPERS, AUDIO FEEDBACK & TIMER
     // =========================================================================
-    function normalizeInput(str) {
-      if (!str) return '';
-      const halfWidth = str.replace(/[\uff01-\uff5e]/g, ch =>
-        String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
-      );
-      return halfWidth.trim().replace(/\s+/g, '').toLowerCase();
-    }
-
-    function biText(zh, ja, tag = 'div', zhClass = '', jaClass = 'text-xs text-stone-500 mt-0.5') {
-      if (state.langMode === 'zh') {
-        return `<${tag} class="${zhClass}">${zh}</${tag}>`;
-      }
-      if (state.langMode === 'ja') {
-        return `<${tag} class="${zhClass}">${ja}</${tag}>`;
-      }
-      return `<${tag} class="${zhClass}">${zh}</${tag}><${tag} class="${jaClass}">${ja}</${tag}>`;
-    }
-
-    function playChime(isSuccess) {
+    function playChime(success = true) {
       try {
         const AudioCtx = window.AudioContext || window.webkitAudioContext;
         if (!AudioCtx) return;
@@ -1075,239 +1107,174 @@
         const gain = ctx.createGain();
         osc.connect(gain);
         gain.connect(ctx.destination);
-
-        const now = ctx.currentTime;
-        if (isSuccess) {
+        if (success) {
           osc.type = 'triangle';
-          osc.frequency.setValueAtTime(523.25, now);
-          osc.frequency.setValueAtTime(659.25, now + 0.08);
-          osc.frequency.setValueAtTime(783.99, now + 0.16);
-          gain.gain.setValueAtTime(0.15, now);
-          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.38);
-          osc.start(now);
-          osc.stop(now + 0.38);
+          osc.frequency.setValueAtTime(523.25, ctx.currentTime);
+          osc.frequency.setValueAtTime(659.25, ctx.currentTime + 0.09);
+          osc.frequency.setValueAtTime(783.99, ctx.currentTime + 0.18);
+          gain.gain.setValueAtTime(0.12, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.45);
         } else {
           osc.type = 'sawtooth';
-          osc.frequency.setValueAtTime(220, now);
-          osc.frequency.setValueAtTime(185, now + 0.12);
-          gain.gain.setValueAtTime(0.12, now);
-          gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
-          osc.start(now);
-          osc.stop(now + 0.28);
+          osc.frequency.setValueAtTime(190, ctx.currentTime);
+          gain.gain.setValueAtTime(0.1, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.25);
         }
-      } catch (e) {}
+      } catch (e) {
+        // Ignore audio restrictions
+      }
     }
 
-    function showToast(msgZh, msgJa = '', type = 'info') {
+    function showToast(zh, ja, type = 'info') {
       const container = document.getElementById('toast-container');
       if (!container) return;
-      const colors = {
-        success: 'bg-forest text-white border-emerald-300',
-        error: 'bg-rose-800 text-white border-rose-300',
-        info: 'bg-slate-800 text-white border-gold'
-      };
-      const icons = {
-        success: 'fa-circle-check',
-        error: 'fa-circle-exclamation',
-        info: 'fa-sparkles'
-      };
       const el = document.createElement('div');
-      el.className = `${colors[type] || colors.info} border px-4 py-2.5 rounded-xl shadow-xl flex items-center gap-2.5 text-xs sm:text-sm font-bold transition-all duration-300 opacity-0 -translate-y-2`;
-      const text = state.langMode === 'ja' && msgJa ? msgJa : (state.langMode === 'both' && msgJa ? `${msgZh} / ${msgJa}` : msgZh);
-      el.innerHTML = `<i class="fa-solid ${icons[type] || icons.info} text-base shrink-0"></i><span>${text}</span>`;
+      const bgMap = {
+        success: 'bg-forest text-white border-emerald-400',
+        error: 'bg-rose-900 text-white border-rose-400',
+        info: 'bg-ink text-white border-gold'
+      };
+      el.className = `${bgMap[type] || bgMap.info} border-l-4 px-4 py-2.5 rounded-xl shadow-xl text-xs sm:text-sm font-medium transition-all duration-300 transform translate-y-0 opacity-100`;
+      el.innerHTML = `
+        <div class="font-bold">${zh}</div>
+        ${ja ? `<div class="text-[11px] opacity-90 mt-0.5">${ja}</div>` : ''}
+      `;
       container.appendChild(el);
-
-      requestAnimationFrame(() => {
-        el.classList.remove('opacity-0', '-translate-y-2');
-      });
       setTimeout(() => {
         el.classList.add('opacity-0', '-translate-y-2');
         setTimeout(() => el.remove(), 300);
-      }, 2600);
+      }, 2800);
     }
 
-    // =========================================================================
-    // 4. STATS, TIMER & NAVIGATION HANDLERS
-    // =========================================================================
-    function calculateStats() {
-      let score = 0;
-      let shards = 0;
-      const maxScore = MUSEUMS.length * 11;
-
-      MUSEUMS.forEach(m => {
-        const p = state.progress[m.id];
-        const solvedCount = m.questions.filter(q => p.solved[q.id]).length;
-        const hasPhoto = Boolean(p.photoData);
-        score += solvedCount * 2 + (hasPhoto ? 3 : 0);
-        p.completed = (solvedCount === m.questions.length && hasPhoto);
-        if (p.completed) shards += 1;
-      });
-
-      return { score, shards, maxScore };
+    function biText(zh, ja, tag = 'div', zhClass = '', jaClass = 'text-xs text-stone-600 mt-0.5') {
+      if (state.langMode === 'zh') {
+        return `<${tag} class="${zhClass}">${zh}</${tag}>`;
+      }
+      if (state.langMode === 'ja') {
+        return `<${tag} class="${zhClass}">${ja}</${tag}>`;
+      }
+      return `
+        <${tag} class="${zhClass}">${zh}</${tag}>
+        <${tag} class="${jaClass}">${ja}</${tag}>
+      `;
     }
 
-    function updateHeaderStats() {
-      const { score, shards } = calculateStats();
-      const scoreEl = document.getElementById('header-score');
-      const shardsEl = document.getElementById('header-shards');
-      const teamEl = document.getElementById('header-team-name');
-      const timerEl = document.getElementById('timer-display');
-
-      if (scoreEl) scoreEl.textContent = score;
-      if (shardsEl) shardsEl.textContent = `${shards}/${MUSEUMS.length}`;
-      if (teamEl) {
-        teamEl.textContent = state.teamName
-          ? `${state.teamName} (${state.morningGroup}組)`
-          : '點擊此處設定小隊名稱';
-      }
-      if (timerEl) {
-        const mins = Math.floor(state.timerSeconds / 60);
-        const secs = state.timerSeconds % 60;
-        timerEl.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-      }
-
-      ['both', 'zh', 'ja'].forEach(mode => {
-        const btn = document.getElementById(`btn-lang-${mode}`);
+    function applyLangButtonUI() {
+      ['both', 'zh', 'ja'].forEach(m => {
+        const btn = document.getElementById(`btn-lang-${m}`);
         if (!btn) return;
-        if (state.langMode === mode) {
+        if (state.langMode === m) {
           btn.className = 'px-2 py-1 rounded-md font-bold transition bg-gold text-ink';
         } else {
           btn.className = 'px-2 py-1 rounded-md font-medium transition text-white/80 hover:text-white';
-        }
-      });
-
-      const navMap = {
-        hub: 'nav-hub',
-        museum: 'nav-hub',
-        bag: 'nav-bag',
-        certificate: 'nav-cert',
-        teacher: 'nav-teacher'
-      };
-      ['nav-hub', 'nav-bag', 'nav-cert', 'nav-teacher'].forEach(id => {
-        const el = document.getElementById(id);
-        if (!el) return;
-        if (navMap[state.currentView] === id) {
-          el.className = 'flex flex-col items-center justify-center py-1 rounded-lg text-brick font-bold';
-        } else {
-          el.className = 'flex flex-col items-center justify-center py-1 rounded-lg text-stone-500 hover:text-brick';
         }
       });
     }
 
     function setLangMode(mode) {
       state.langMode = mode;
+      applyLangButtonUI();
       saveAndSyncState();
-      updateHeaderStats();
       render();
     }
 
-    function navigateTo(view, museumId = null) {
-      state.currentView = view;
-      state.activeMuseumId = museumId;
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-      updateHeaderStats();
-      render();
-
-      if (view === 'teacher' && state.teacherAuthenticated) {
-        fetchAllTeamsFromCloud(false);
-        startTeacherAutoPoll();
-      } else {
-        stopTeacherAutoPoll();
+    function updateTimerDisplay() {
+      const disp = document.getElementById('timer-display');
+      const icon = document.getElementById('timer-icon');
+      if (!disp) return;
+      const mins = Math.floor(state.timerSeconds / 60);
+      const secs = state.timerSeconds % 60;
+      disp.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      if (icon) {
+        icon.className = state.timerRunning
+          ? 'fa-solid fa-stopwatch text-emerald-300 animate-pulse'
+          : 'fa-regular fa-clock';
       }
     }
 
-    function startTeacherAutoPoll() {
-      stopTeacherAutoPoll();
-      teacherPollInterval = setInterval(() => {
-        if (state.currentView === 'teacher' && state.teacherAuthenticated) {
-          fetchAllTeamsFromCloud(false);
-        }
-      }, 8000);
-    }
-
-    function stopTeacherAutoPoll() {
-      if (teacherPollInterval) {
-        clearInterval(teacherPollInterval);
-        teacherPollInterval = null;
-      }
-    }
-
-    function startTimer(silent = false) {
-      if (state.timerRunning || state.timerSeconds <= 0) return;
+    function startTimer() {
+      if (state.timerRunning) return;
       state.timerRunning = true;
-      if (!silent) {
-        showToast('90 分鐘探索倒數開始！', '90分カウントダウン開始！', 'success');
-      }
+      updateTimerDisplay();
       timerInterval = setInterval(() => {
         if (state.timerSeconds > 0) {
           state.timerSeconds -= 1;
-          updateHeaderStats();
+          updateTimerDisplay();
         } else {
           clearInterval(timerInterval);
           state.timerRunning = false;
-          showToast('時間到！請全體小隊返回集合點！', '時間終了！集合場所へ戻ってください！', 'error');
+          updateTimerDisplay();
+          showToast('90 分鐘倒數結束！請準備返回集合點', '90分の制限時間が終了しました！集合場所へ戻りましょう', 'info');
         }
       }, 1000);
-      updateHeaderStats();
     }
 
     function toggleTimer() {
       if (state.timerRunning) {
         clearInterval(timerInterval);
         state.timerRunning = false;
+        updateTimerDisplay();
         showToast('倒數計時已暫停', 'タイマーを一時停止しました', 'info');
-        updateHeaderStats();
       } else {
-        startTimer(false);
+        startTimer();
+        showToast('90 分鐘探索倒數開始！', '90分カウントダウン開始！', 'success');
       }
     }
 
     // =========================================================================
-    // 5. MODALS: TEAM SETUP, HINTS & PHOTO ZOOM
+    // 5. MODALS & NAVIGATION
     // =========================================================================
     function openTeamModal() {
+      const modal = document.getElementById('team-modal');
+      if (!modal) return;
       document.getElementById('input-team-name').value = state.teamName;
       document.getElementById('input-morning-group').value = state.morningGroup;
       document.getElementById('input-start-museum').value = state.startMuseum;
-      const modal = document.getElementById('team-modal');
       modal.classList.remove('hidden');
       modal.classList.add('flex');
     }
 
     function closeTeamModal() {
       const modal = document.getElementById('team-modal');
+      if (!modal) return;
       modal.classList.add('hidden');
       modal.classList.remove('flex');
     }
 
     function saveTeamSettings() {
       const nameVal = document.getElementById('input-team-name').value.trim();
-      state.teamName = nameVal || '探索小隊';
+      if (!nameVal) {
+        showToast('請輸入小隊名稱！', 'チーム名を入力してください！', 'error');
+        return;
+      }
+      state.teamName = nameVal;
       state.morningGroup = document.getElementById('input-morning-group').value;
       state.startMuseum = document.getElementById('input-start-museum').value;
-      saveAndSyncState();
       closeTeamModal();
-      if (!state.timerRunning) {
-        startTimer(true);
-      }
       updateHeaderStats();
+      startTimer();
+      saveAndSyncState();
       render();
-      showToast('小隊編制已儲存，90 分鐘倒數開始！', 'チーム設定完了！90分カウントダウン開始！', 'success');
+      showToast(`小隊「${state.teamName}」已建立，90分鐘倒數開始！`, `チーム「${state.teamName}」を保存し、タイマーを開始しました！`, 'success');
     }
 
     function openHintModal(museumId, qIndex) {
       const m = MUSEUMS.find(x => x.id === museumId);
-      if (!m) return;
+      if (!m || !m.questions[qIndex]) return;
       const q = m.questions[qIndex];
       const content = document.getElementById('hint-modal-content');
       content.innerHTML = `
         <div class="p-3 rounded-xl bg-amber-50 border border-amber-200 text-ink">
-          <p class="font-bold text-brick mb-1">🇹🇼 中文線索：</p>
-          <p>${q.hintZh}</p>
+          <div class="font-bold text-amber-900 mb-1">🇹🇼 中文提示</div>
+          <div>${q.hintZh}</div>
         </div>
-        <div class="p-3 rounded-xl bg-sky-50 border border-sky-200 text-ink">
-          <p class="font-bold text-sky-900 mb-1">🇯🇵 日本語ヒント：</p>
-          <p>${q.hintJa}</p>
+        <div class="p-3 rounded-xl bg-stone-100 border border-stone-200 text-ink">
+          <div class="font-bold text-stone-800 mb-1">🇯🇵 日本語ヒント</div>
+          <div>${q.hintJa}</div>
         </div>
       `;
       const modal = document.getElementById('hint-modal');
@@ -1317,68 +1284,98 @@
 
     function closeHintModal() {
       const modal = document.getElementById('hint-modal');
+      if (!modal) return;
       modal.classList.add('hidden');
       modal.classList.remove('flex');
     }
 
     function openPhotoZoom(src, caption) {
-      document.getElementById('zoom-img').src = src;
-      document.getElementById('zoom-caption').textContent = caption;
       const modal = document.getElementById('photo-zoom-modal');
+      if (!modal) return;
+      document.getElementById('zoom-img').src = src;
+      document.getElementById('zoom-caption').textContent = caption || '';
       modal.classList.remove('hidden');
       modal.classList.add('flex');
     }
 
     function closePhotoZoom() {
       const modal = document.getElementById('photo-zoom-modal');
+      if (!modal) return;
       modal.classList.add('hidden');
       modal.classList.remove('flex');
     }
 
-    // =========================================================================
-    // 6. PUZZLE & PHOTO SUBMISSION LOGIC
-    // =========================================================================
-    function checkAnswerMatch(userRaw, validList) {
-      const normUser = normalizeInput(userRaw);
-      if (!normUser) return false;
-      return validList.some(ans => normalizeInput(ans) === normUser);
-    }
+    function navigateTo(view, museumId = null) {
+      state.currentView = view;
+      state.activeMuseumId = museumId;
 
-    function submitChoiceAnswer(museumId, qId, choiceVal) {
-      const m = MUSEUMS.find(x => x.id === museumId);
-      const q = m.questions.find(x => x.id === qId);
-      if (!q) return;
-
-      if (checkAnswerMatch(choiceVal, q.answers)) {
-        state.progress[museumId].solved[qId] = true;
-        playChime(true);
-        saveAndSyncState();
-        updateHeaderStats();
-        render();
-        showToast('答對了！獲得 +2 積分', '正解です！+2ポイント獲得', 'success');
-      } else {
-        playChime(false);
-        showToast('答案不正確，再觀察看看或點擊提示喔！', '不正解です。ヒントを見てみましょう！', 'error');
+      if (teacherPollInterval) {
+        clearInterval(teacherPollInterval);
+        teacherPollInterval = null;
       }
+
+      ['hub', 'bag', 'certificate', 'teacher'].forEach(nav => {
+        const btn = document.getElementById(`nav-${nav}`);
+        if (!btn) return;
+        const activeNav = (view === 'museum' && nav === 'hub') || (view === nav);
+        btn.className = activeNav
+          ? 'flex flex-col items-center justify-center py-1 rounded-lg text-brick font-bold'
+          : 'flex flex-col items-center justify-center py-1 rounded-lg text-stone-500 hover:text-brick';
+      });
+
+      if (view === 'teacher' && state.teacherAuthenticated) {
+        fetchAllTeamsFromCloud(false);
+        teacherPollInterval = setInterval(() => fetchAllTeamsFromCloud(false), 8000);
+      }
+
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      render();
     }
 
-    function submitTextAnswer(museumId, qId) {
-      const inputEl = document.getElementById(`ans-input-${qId}`);
-      if (!inputEl) return;
+    // =========================================================================
+    // 6. TASK INTERACTION HANDLERS (QUIZ, PHOTO, REFLECTION)
+    // =========================================================================
+    function normalizeAnswer(str) {
+      return String(str || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+        .replace(/\s+/g, '');
+    }
+
+    function checkAnswer(museumId, qId) {
       const m = MUSEUMS.find(x => x.id === museumId);
+      if (!m) return;
       const q = m.questions.find(x => x.id === qId);
       if (!q) return;
 
-      if (checkAnswerMatch(inputEl.value, q.answers)) {
+      let userVal = '';
+      if (q.type === 'text') {
+        const input = document.getElementById(`input-${qId}`);
+        userVal = input ? input.value : '';
+      } else {
+        const selected = document.querySelector(`input[name="radio-${qId}"]:checked`);
+        userVal = selected ? selected.value : '';
+      }
+
+      if (!userVal.trim()) {
+        showToast('請先輸入或選擇答案！', '答えを入力または選択してください！', 'error');
+        return;
+      }
+
+      const normUser = normalizeAnswer(userVal);
+      const isCorrect = q.answers.some(ans => normalizeAnswer(ans) === normUser);
+
+      if (isCorrect) {
         state.progress[museumId].solved[qId] = true;
         playChime(true);
         saveAndSyncState();
         updateHeaderStats();
         render();
-        showToast('破譯成功！獲得 +2 積分', '解読成功！+2ポイント獲得', 'success');
+        showToast('答對了！獲得 +2 積分！', '正解です！+2ポイント獲得！', 'success');
       } else {
         playChime(false);
-        showToast('密碼不符，請檢查字元或點選提示按鈕！', '答えが違います。ヒントを確認してください！', 'error');
+        showToast('答案不正確，再觀察展品或點擊「提示」吧！', '不正解です。展示品をもう一度観察するか「ヒント」を見てみましょう！', 'error');
       }
     }
 
@@ -1391,15 +1388,12 @@
         const img = new Image();
         img.onload = function () {
           const canvas = document.createElement('canvas');
-          const maxDim = 420;
+          const MAX_WIDTH = 720;
           let width = img.width;
           let height = img.height;
-          if (width > height && width > maxDim) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          } else if (height > maxDim) {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
+          if (width > MAX_WIDTH) {
+            height = Math.round((height * MAX_WIDTH) / width);
+            width = MAX_WIDTH;
           }
           canvas.width = width;
           canvas.height = height;
@@ -1419,16 +1413,58 @@
       reader.readAsDataURL(file);
     }
 
+    function saveMuseumReflection(museumId) {
+      const textarea = document.getElementById(`reflection-input-${museumId}`);
+      if (!textarea) return;
+      const text = textarea.value.trim();
+      if (!text) {
+        showToast('請先輸入心得與感想再送出喔！', '感想を入力してから送信してください！', 'error');
+        textarea.focus();
+        return;
+      }
+      state.progress[museumId].reflection = text;
+      playChime(true);
+      saveAndSyncState();
+      render();
+      showToast('心得感想已儲存並同步至教師後台！', '感想を保存し、教員画面に送信しました！', 'success');
+    }
+
+    function unlockTeacher() {
+      const input = document.getElementById('teacher-pass-input');
+      if (!input) return;
+      const val = normalizeAnswer(input.value);
+      if (val === '20270304') {
+        state.teacherAuthenticated = true;
+        playChime(true);
+        navigateTo('teacher');
+        showToast('教師攻略與戰情室已解鎖！', '教員ガイドとリアルタイム進捗画面を解除しました！', 'success');
+      } else {
+        playChime(false);
+        showToast('密碼錯誤，請重新輸入！', 'パスワードが違います！', 'error');
+        input.value = '';
+        input.focus();
+      }
+    }
+
+    function lockTeacher() {
+      state.teacherAuthenticated = false;
+      if (teacherPollInterval) {
+        clearInterval(teacherPollInterval);
+        teacherPollInterval = null;
+      }
+      render();
+      showToast('已重新上鎖教師攻略', '教員画面をロックしました', 'info');
+    }
+
     // =========================================================================
     // 7. VIEW RENDERERS (HUB, MUSEUM, BAG, CERTIFICATE, TEACHER)
     // =========================================================================
     function render() {
       const main = document.getElementById('app-main');
       if (!main) return;
-
       if (state.currentView === 'hub') {
         main.innerHTML = renderHubView();
-      } else if (state.currentView === 'museum' && state.activeMuseumId) {
+      } else if (state.currentView === 'museum') {
         main.innerHTML = renderMuseumView(state.activeMuseumId);
       } else if (state.currentView === 'bag') {
         main.innerHTML = renderBagView();
@@ -1436,105 +1472,100 @@
         main.innerHTML = renderCertificateView();
       } else if (state.currentView === 'teacher') {
         main.innerHTML = renderTeacherView();
-      } else {
-        main.innerHTML = renderHubView();
       }
     }
 
     function renderHubView() {
       const morningMuseums = MUSEUMS.filter(m => m.session === 'morning');
       const afternoonMuseums = MUSEUMS.filter(m => m.session === 'afternoon');
-      const firstMorningId = state.morningGroup === 'A' ? 'medical' : 'anatomy';
+
+      // Rotate afternoon museums starting from team's designated startMuseum
+      const startIdx = afternoonMuseums.findIndex(m => m.id === state.startMuseum);
+      const orderedAfternoon = startIdx > 0
+        ? [...afternoonMuseums.slice(startIdx), ...afternoonMuseums.slice(0, startIdx)]
+        : afternoonMuseums;
+
+      // Morning order based on A/B group
+      const orderedMorning = state.morningGroup === 'B'
+        ? [...morningMuseums].reverse()
+        : morningMuseums;
+
+      const renderMuseumCard = (m, stepLabel) => {
+        const p = state.progress[m.id];
+        const solvedCount = Object.keys(p.solved).length;
+        const totalTasks = m.questions.length + 1;
+        const doneTasks = solvedCount + (p.photoData ? 1 : 0);
+        const pct = Math.round((doneTasks / totalTasks) * 100);
+
+        return `
+          <div onclick="navigateTo('museum', '${m.id}')" class="bg-white rounded-2xl p-4 archival-shadow border ${p.completed ? 'border-emerald-500' : 'border-stone-200'} hover:border-brick cursor-pointer transition active:scale-[0.99]">
+            <div class="flex items-start justify-between gap-3">
+              <div class="flex items-center gap-3">
+                <div class="w-12 h-12 rounded-2xl ${m.color} text-white flex items-center justify-center text-xl shadow shrink-0">
+                  <i class="fa-solid ${m.icon}"></i>
+                </div>
+                <div>
+                  <div class="flex items-center gap-1.5 flex-wrap">
+                    <span class="text-[11px] font-bold px-2 py-0.5 rounded-full bg-goldLight text-ink">${stepLabel}</span>
+                    ${p.completed ? '<span class="text-[11px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">✓ 已集齊碎片</span>' : ''}
+                  </div>
+                  ${biText(m.titleZh, m.titleJa, 'h3', 'font-black text-base text-ink mt-1', 'text-xs text-stone-600')}
+                </div>
+              </div>
+              <i class="fa-solid fa-chevron-right text-stone-400 mt-2"></i>
+            </div>
+
+            <div class="mt-3 pt-2.5 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500">
+              <span><i class="fa-solid fa-location-dot text-brick mr-1"></i>${state.langMode === 'ja' ? m.locationJa : m.locationZh}</span>
+              <span class="font-bold ${p.completed ? 'text-emerald-700' : 'text-brick'}">${doneTasks}/${totalTasks} (${pct}%)</span>
+            </div>
+            <div class="w-full h-1.5 bg-stone-200 rounded-full overflow-hidden mt-1.5">
+              <div class="h-full ${p.completed ? 'bg-emerald-600' : 'bg-brick'} transition-all duration-300" style="width: ${pct}%"></div>
+            </div>
+          </div>
+        `;
+      };
 
       return `
         <div class="space-y-5">
-          <!-- Team Banner Card -->
-          <div onclick="openTeamModal()" class="cursor-pointer bg-white rounded-2xl p-4 archival-shadow border-2 border-gold/70 hover:border-brick transition flex items-center justify-between gap-3">
-            <div class="flex items-center gap-3">
-              <div class="w-11 h-11 rounded-xl bg-brick text-goldLight flex items-center justify-center text-xl shrink-0">
-                <i class="fa-solid fa-flag-checkered"></i>
-              </div>
+          <!-- Hero / Team Banner -->
+          <div class="bg-gradient-to-br from-brick to-brickDark text-white rounded-2xl p-4 sm:p-5 archival-shadow border border-gold/60">
+            <div class="flex items-start justify-between gap-3">
               <div>
-                <div class="text-xs font-bold text-brick uppercase tracking-wider">
-                  ${state.teamName ? `探索小隊：${state.teamName}` : '尚未設定小隊名稱（點擊設定）'}
-                </div>
-                <div class="text-sm font-bold text-ink mt-0.5">
-                  上午 ${state.morningGroup} 組（${state.morningGroup === 'A' ? '09:30 醫博 → 10:30 解剖' : '09:30 解剖 → 10:30 醫博'}）
-                </div>
-                <div class="text-xs text-stone-500">
-                  下午起始站：${MUSEUMS.find(m => m.id === state.startMuseum)?.titleZh || '校史館'}
-                </div>
+                <span class="text-[11px] uppercase tracking-widest text-goldLight font-bold">NTU MUSEUMS BILINGUAL RPG</span>
+                ${biText('時空檔案館：臺大博物館群實境解謎', '時空アーカイブ：台湾大学博物館群リアル謎解き', 'h2', 'text-lg sm:text-xl font-black mt-0.5', 'text-xs sm:text-sm text-goldLight/90 mt-0.5')}
               </div>
+              <button onclick="openTeamModal()" class="px-3 py-1.5 rounded-xl bg-gold hover:bg-amber-400 text-ink font-bold text-xs shadow shrink-0 transition ${!state.teamName ? 'glow-gold' : ''}">
+                <i class="fa-solid fa-pen-to-square mr-1"></i>${state.teamName ? '修改隊伍' : '設定小隊'}
+              </button>
             </div>
-            <span class="px-2.5 py-1.5 rounded-lg bg-parchment border border-stone-300 text-xs font-bold text-ink shrink-0">
-              <i class="fa-solid fa-pen-to-square mr-1"></i>設定
-            </span>
+            <div class="mt-3 pt-3 border-t border-white/15 flex flex-wrap items-center justify-between gap-2 text-xs text-goldLight">
+              <span><i class="fa-solid fa-users mr-1"></i>小隊：<strong>${state.teamName ? escapeHtml(state.teamName) : '尚未設定（請先點擊右上按鈕）'}</strong></span>
+              <span><i class="fa-solid fa-route mr-1"></i>上午 <strong>${state.morningGroup} 組</strong> ｜ 下午起始 <strong>${MUSEUMS.find(x => x.id === state.startMuseum)?.titleZh.replace('國立臺灣大學', '')}</strong></span>
+            </div>
           </div>
 
-          <!-- Morning Session Section -->
+          <!-- Morning Session -->
           <section class="space-y-2.5">
             <div class="flex items-center justify-between px-1">
-              <div>
-                <h2 class="text-base font-black text-brick flex items-center gap-1.5">
-                  <i class="fa-solid fa-sun text-amber-500"></i>
-                  <span>上午場｜台大醫學院區雙館輪替（09:30–11:30）</span>
-                </h2>
-                <p class="text-xs text-stone-500">午前の部｜医学部キャンパス2館ローテーション（各1時間）</p>
-              </div>
+              ${biText('☀️ 上午場｜醫學院雙館探索（09:30–11:30）', '☀️ 午前の部｜医学部2館探索（09:30–11:30）', 'h3', 'font-black text-sm text-brick', 'text-xs text-stone-600')}
+              <span class="text-[11px] font-bold text-rose-800 bg-rose-100 px-2 py-0.5 rounded-full">仁愛路醫學院區</span>
             </div>
-            <div class="grid grid-cols-1 gap-3">
-              ${morningMuseums.map(m => renderMuseumCard(m, m.id === firstMorningId, '上午第一站 / 午前第1館')).join('')}
+            <div class="space-y-3">
+              ${orderedMorning.map((m, idx) => renderMuseumCard(m, `上午第 ${idx + 1} 站 (${state.morningGroup}組路線)`)).join('')}
             </div>
           </section>
 
-          <!-- Afternoon Session Section -->
+          <!-- Afternoon Session -->
           <section class="space-y-2.5">
             <div class="flex items-center justify-between px-1">
-              <div>
-                <h2 class="text-base font-black text-forest flex items-center gap-1.5">
-                  <i class="fa-solid fa-compass text-forest"></i>
-                  <span>下午場｜公館校總區五館大地遊戲（13:20–14:50）</span>
-                </h2>
-                <p class="text-xs text-stone-500">午後の部｜本キャンパス5館フィールドRPG（90分）</p>
-              </div>
+              ${biText('🌿 下午場｜校總區五館大地遊戲（13:20–14:50）', '🌿 午後の部｜本キャンパス5館ラリー（13:20–14:50）', 'h3', 'font-black text-sm text-forest', 'text-xs text-stone-600')}
+              <span class="text-[11px] font-bold text-emerald-900 bg-emerald-100 px-2 py-0.5 rounded-full">公館校總區</span>
             </div>
-            <div class="grid grid-cols-1 gap-3">
-              ${afternoonMuseums.map(m => renderMuseumCard(m, m.id === state.startMuseum, '下午起始站 / 午後スタート')).join('')}
+            <div class="space-y-3">
+              ${orderedAfternoon.map((m, idx) => renderMuseumCard(m, idx === 0 ? '★ 下午起始第 1 站' : `下午建議第 ${idx + 1} 站`)).join('')}
             </div>
           </section>
-        </div>
-      `;
-    }
-
-    function renderMuseumCard(m, isHighlighted, highlightLabel) {
-      const p = state.progress[m.id];
-      const solvedCount = m.questions.filter(q => p.solved[q.id]).length;
-      const totalTasks = m.questions.length + 1;
-      const doneTasks = solvedCount + (p.photoData ? 1 : 0);
-
-      return `
-        <div onclick="navigateTo('museum', '${m.id}')" class="cursor-pointer bg-white rounded-2xl p-4 archival-shadow border-2 transition transform active:scale-[0.99] ${p.completed ? 'border-forest bg-emerald-50/30' : (isHighlighted ? 'border-gold glow-gold' : 'border-stone-200 hover:border-brick/50')}">
-          <div class="flex items-start justify-between gap-3">
-            <div class="flex items-start gap-3">
-              <div class="w-12 h-12 rounded-xl ${m.color} text-white flex items-center justify-center text-xl shrink-0 shadow-sm">
-                <i class="fa-solid ${m.icon}"></i>
-              </div>
-              <div>
-                <div class="flex flex-wrap items-center gap-1.5 mb-0.5">
-                  <span class="text-[11px] font-bold px-2 py-0.5 rounded bg-paper text-stone-700">${m.orderBadge}</span>
-                  ${isHighlighted && !p.completed ? `<span class="text-[11px] font-bold px-2 py-0.5 rounded bg-gold text-ink"><i class="fa-solid fa-star mr-0.5"></i>${highlightLabel}</span>` : ''}
-                  ${p.completed ? `<span class="text-[11px] font-bold px-2 py-0.5 rounded bg-forest text-white"><i class="fa-solid fa-check mr-0.5"></i>已通關</span>` : ''}
-                </div>
-                ${biText(m.titleZh, m.titleJa, 'h3', 'font-black text-base text-ink', 'text-xs text-stone-500')}
-                <p class="text-xs text-stone-500 mt-1"><i class="fa-solid fa-location-dot text-brick mr-1"></i>${state.langMode === 'ja' ? m.locationJa : m.locationZh}</p>
-              </div>
-            </div>
-            <div class="text-right shrink-0">
-              <div class="text-xs font-black ${p.completed ? 'text-forest' : 'text-brick'}">${doneTasks}/${totalTasks}</div>
-              <div class="text-[10px] text-stone-400 mt-0.5">任務進度</div>
-              <i class="fa-solid fa-chevron-right text-stone-400 mt-2"></i>
-            </div>
-          </div>
         </div>
       `;
     }
@@ -1546,32 +1577,39 @@
 
       return `
         <div class="space-y-4">
-          <div class="bg-white rounded-2xl p-4 archival-shadow border border-stone-200">
-            <button onclick="navigateTo('hub')" class="inline-flex items-center gap-1.5 text-xs font-bold text-brick hover:underline mb-3">
+          <!-- Back & Museum Header -->
+          <div class="flex items-center justify-between">
+            <button onclick="navigateTo('hub')" class="inline-flex items-center gap-1.5 text-xs font-bold text-brick hover:underline bg-white px-3 py-1.5 rounded-xl border border-stone-200 shadow-sm">
               <i class="fa-solid fa-arrow-left"></i>
               <span>返回任務地圖 / マップへ戻る</span>
             </button>
+            <span class="text-xs font-bold px-2.5 py-1 rounded-full bg-goldLight text-ink">
+              碎片：${m.shardNameZh} / ${m.shardNameJa}
+            </span>
+          </div>
+
+          <div class="${m.color} text-white rounded-2xl p-4 archival-shadow">
             <div class="flex items-center gap-3">
-              <div class="w-12 h-12 rounded-xl ${m.color} text-white flex items-center justify-center text-xl shrink-0">
+              <div class="w-12 h-12 rounded-2xl bg-white/15 flex items-center justify-center text-2xl shrink-0">
                 <i class="fa-solid ${m.icon}"></i>
               </div>
               <div>
-                ${biText(m.titleZh, m.titleJa, 'h2', 'text-lg sm:text-xl font-black text-ink', 'text-xs text-stone-500')}
-                <p class="text-xs text-stone-500 mt-0.5"><i class="fa-regular fa-clock mr-1"></i>${m.hoursZh}</p>
+                ${biText(m.titleZh, m.titleJa, 'h2', 'text-lg font-black', 'text-xs text-white/90')}
+                <div class="text-[11px] text-white/80 mt-1"><i class="fa-regular fa-clock mr-1"></i>${m.hoursZh}</div>
               </div>
             </div>
-
-            <div class="mt-3 p-3.5 rounded-xl bg-parchment border border-gold/60 text-xs sm:text-sm leading-relaxed text-ink">
-              ${state.langMode === 'ja' ? m.npcJa : (state.langMode === 'zh' ? m.npcZh : `${m.npcZh}<hr class="my-2 border-stone-300/70"><div class="text-xs text-stone-600">${m.npcJa}</div>`)}
+            <div class="mt-3 p-3 rounded-xl bg-black/25 text-xs leading-relaxed space-y-1">
+              ${biText(m.npcZh, m.npcJa, 'p', 'text-white', 'text-white/85')}
             </div>
           </div>
 
+          <!-- 4 Questions -->
           <div class="space-y-3">
             ${m.questions.map((q, idx) => {
-              const isSolved = Boolean(p.solved[q.id]);
+              const solved = Boolean(p.solved[q.id]);
               return `
-                <div class="bg-white rounded-2xl p-4 archival-shadow border-2 transition ${isSolved ? 'border-forest bg-emerald-50/20' : 'border-stone-200'}">
-                  <div class="flex items-start justify-between gap-2 mb-2">
+                <div class="bg-white rounded-2xl p-4 archival-shadow border-2 ${solved ? 'border-emerald-500' : 'border-stone-200'} space-y-3">
+                  <div class="flex items-start justify-between gap-2">
                     <div>
                       ${biText(q.titleZh, q.titleJa, 'h3', 'font-black text-sm text-brick', 'text-[11px] text-stone-500')}
                     </div>
@@ -1579,51 +1617,41 @@
                       <button onclick="openHintModal('${m.id}', ${idx})" class="px-2.5 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 text-amber-900 text-xs font-bold transition">
                         <i class="fa-solid fa-lightbulb mr-1"></i>提示
                       </button>
-                      <span class="px-2 py-1 rounded-lg text-xs font-bold ${isSolved ? 'bg-forest text-white' : 'bg-stone-100 text-stone-500'}">
-                        ${isSolved ? '✓ +2分' : '2分'}
+                      <span class="px-2 py-1 rounded-lg text-xs font-bold ${solved ? 'bg-emerald-600 text-white' : 'bg-stone-100 text-stone-500'}">
+                        ${solved ? '✓ +2分' : '2分'}
                       </span>
                     </div>
                   </div>
 
-                  <div class="text-sm text-ink leading-relaxed mb-3">
+                  <div class="text-xs sm:text-sm text-ink leading-relaxed">
                     ${biText(q.promptZh, q.promptJa, 'p', 'font-medium', 'text-xs text-stone-600 mt-1')}
                   </div>
 
-                  ${q.type === 'choice' ? `
-                    <div class="space-y-2">
-                      ${q.options.map(opt => {
-                        const isCorrectOpt = isSolved && q.answers.includes(opt.val);
-                        return `
-                          <button
-                            onclick="submitChoiceAnswer('${m.id}', '${q.id}', '${opt.val}')"
-                            ${isSolved ? 'disabled' : ''}
-                            class="w-full text-left p-3 rounded-xl border text-xs sm:text-sm transition ${isCorrectOpt ? 'bg-forest text-white border-forest font-bold' : 'bg-parchment/70 hover:bg-goldLight/40 border-stone-300 text-ink'}"
-                          >
-                            ${state.langMode === 'ja' ? opt.labelJa : (state.langMode === 'zh' ? opt.labelZh : `${opt.labelZh}<div class="text-[11px] opacity-80 mt-0.5">${opt.labelJa}</div>`)}
-                          </button>
-                        `;
-                      }).join('')}
+                  ${solved ? `
+                    <div class="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs font-bold flex items-center gap-2">
+                      <i class="fa-solid fa-circle-check text-emerald-600 text-base"></i>
+                      <span>已破解此題線索！ / クリア済み！</span>
+                    </div>
+                  ` : q.type === 'text' ? `
+                    <div class="flex gap-2">
+                      <input type="text" id="input-${q.id}" placeholder="${state.langMode === 'ja' ? q.placeholderJa : q.placeholderZh}" class="flex-1 px-3 py-2 rounded-xl border border-stone-300 bg-parchment/50 focus:outline-none focus:border-brick text-sm" />
+                      <button onclick="checkAnswer('${m.id}', '${q.id}')" class="px-4 py-2 rounded-xl bg-brick hover:bg-brickDark text-white font-bold text-xs sm:text-sm shrink-0">
+                        驗證 / 回答
+                      </button>
                     </div>
                   ` : `
-                    <div class="flex gap-2">
-                      <input
-                        type="text"
-                        id="ans-input-${q.id}"
-                        value="${isSolved ? q.answers[0] : ''}"
-                        ${isSolved ? 'disabled' : ''}
-                        onkeydown="if(event.key==='Enter') submitTextAnswer('${m.id}', '${q.id}')"
-                        placeholder="${state.langMode === 'ja' ? q.placeholderJa : q.placeholderZh}"
-                        class="flex-1 px-3 py-2.5 rounded-xl border border-stone-300 bg-parchment/50 focus:outline-none focus:border-brick text-sm disabled:bg-emerald-50 disabled:text-forest disabled:font-bold"
-                      />
-                      ${!isSolved ? `
-                        <button onclick="submitTextAnswer('${m.id}', '${q.id}')" class="px-4 py-2.5 rounded-xl bg-brick hover:bg-brickDark text-white font-bold text-sm shrink-0 transition">
-                          送出
-                        </button>
-                      ` : `
-                        <span class="px-3 py-2.5 rounded-xl bg-forest text-white font-bold text-xs flex items-center shrink-0">
-                          <i class="fa-solid fa-check mr-1"></i>已解鎖
-                        </span>
-                      `}
+                    <div class="space-y-2">
+                      ${q.options.map(opt => `
+                        <label class="flex items-start gap-2.5 p-2.5 rounded-xl border border-stone-200 hover:border-brick bg-parchment/40 cursor-pointer text-xs sm:text-sm">
+                          <input type="radio" name="radio-${q.id}" value="${opt.val}" class="mt-1 accent-brick" />
+                          <div>
+                            ${biText(opt.labelZh, opt.labelJa, 'div', 'font-medium text-ink', 'text-[11px] text-stone-600')}
+                          </div>
+                        </label>
+                      `).join('')}
+                      <button onclick="checkAnswer('${m.id}', '${q.id}')" class="w-full py-2.5 rounded-xl bg-brick hover:bg-brickDark text-white font-bold text-xs sm:text-sm transition">
+                        送出答案 / 回答を送信
+                      </button>
                     </div>
                   `}
                 </div>
@@ -1631,30 +1659,31 @@
             }).join('')}
           </div>
 
-          <div class="bg-white rounded-2xl p-4 archival-shadow border-2 ${p.photoData ? 'border-forest' : 'border-gold'}">
-            <div class="flex items-start justify-between gap-2 mb-2">
+          <!-- 5th Task: Photo Mission -->
+          <div class="bg-white rounded-2xl p-4 archival-shadow border-2 ${p.photoData ? 'border-emerald-500' : 'border-gold'} space-y-3">
+            <div class="flex items-start justify-between gap-2">
               <div>
                 ${biText(m.photoTask.titleZh, m.photoTask.titleJa, 'h3', 'font-black text-sm text-brick', 'text-[11px] text-stone-500')}
               </div>
-              <span class="px-2 py-1 rounded-lg text-xs font-bold shrink-0 ${p.photoData ? 'bg-forest text-white' : 'bg-gold/30 text-ink'}">
+              <span class="px-2 py-1 rounded-lg text-xs font-bold shrink-0 ${p.photoData ? 'bg-emerald-600 text-white' : 'bg-goldLight text-ink'}">
                 ${p.photoData ? '✓ +3分' : '3分'}
               </span>
             </div>
 
-            <div class="text-sm text-ink leading-relaxed mb-3">
+            <div class="text-xs sm:text-sm text-ink leading-relaxed">
               ${biText(m.photoTask.descZh, m.photoTask.descJa, 'p', 'font-medium', 'text-xs text-stone-600 mt-1')}
             </div>
 
-            <div class="p-3 rounded-xl bg-sky-50 border border-sky-200 text-xs text-sky-950 mb-3 leading-relaxed">
-              ${state.langMode === 'ja' ? m.photoTask.bonusJa : (state.langMode === 'zh' ? m.photoTask.bonusZh : `${m.photoTask.bonusZh}<div class="text-[11px] text-sky-800 mt-1">${m.photoTask.bonusJa}</div>`)}
+            <div class="p-2.5 rounded-xl bg-amber-50/80 border border-amber-200 text-xs text-amber-950">
+              ${biText(m.photoTask.bonusZh, m.photoTask.bonusJa, 'div', '', 'text-[11px] text-amber-900 mt-0.5')}
             </div>
 
             ${p.photoData ? `
               <div class="space-y-2">
-                <img src="${p.photoData}" alt="打卡合照" onclick="openPhotoZoom('${p.photoData}', '${m.titleZh}')" class="w-full h-48 object-cover rounded-xl border border-stone-300 cursor-pointer" />
-                <label class="block w-full text-center py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 text-xs font-bold cursor-pointer transition">
-                  <i class="fa-solid fa-camera-rotate mr-1"></i>重新拍攝上傳 / 撮り直す
-                  <input type="file" accept="image/*" capture="environment" onchange="handlePhotoUpload(event, '${m.id}')" class="hidden" />
+                <img src="${p.photoData}" onclick="openPhotoZoom('${p.photoData}', '${m.titleZh}')" alt="小隊打卡合照" class="w-full h-48 object-cover rounded-xl border border-stone-300 cursor-pointer" />
+                <label class="inline-flex items-center justify-center w-full py-2 rounded-xl bg-stone-100 hover:bg-stone-200 text-stone-700 font-bold text-xs cursor-pointer">
+                  <i class="fa-solid fa-camera-rotate mr-1.5"></i>重新拍攝或更換照片 / 写真を撮り直す
+                  <input type="file" accept="image/*" onchange="handlePhotoUpload(event, '${m.id}')" class="hidden" />
                 </label>
               </div>
             ` : `
@@ -1666,6 +1695,41 @@
               </label>
             `}
           </div>
+
+          ${m.id === 'anatomy' ? `
+            <div class="bg-white rounded-2xl p-4 archival-shadow border-2 ${p.reflection ? 'border-pink-600' : 'border-pink-300'} space-y-3">
+              <div class="flex items-start justify-between gap-2">
+                <div>
+                  ${biText('【生命教育反思】參訪心得與感想', '【生命教育の感想】見学後の思い・メッセージ', 'h3', 'font-black text-sm text-pink-800', 'text-[11px] text-stone-500')}
+                </div>
+                <span class="px-2 py-1 rounded-lg text-xs font-bold shrink-0 ${p.reflection ? 'bg-pink-700 text-white' : 'bg-pink-100 text-pink-800'}">
+                  ${p.reflection ? '✓ 已同步教師後台' : '心得回饋'}
+                </span>
+              </div>
+              <div class="text-xs sm:text-sm text-ink leading-relaxed">
+                ${biText(
+                  '參訪解剖學教育展示館與認識「無語良師」後，你對人體構造的奧秘或生命價值有什麼感觸？請寫下小隊的心得與感想（送出後老師可即時在後台看到）：',
+                  '解剖学教育展示館の見学や「無語良師（献体された方々）」について学んだ後、人体の神秘や命の尊さについてどのような感想を持ちましたか？チームの感想を記入してください（送信後、先生の画面に即時共有されます）：',
+                  'p',
+                  'font-medium',
+                  'text-xs text-stone-600 mt-1'
+                )}
+              </div>
+              <textarea
+                id="reflection-input-${m.id}"
+                rows="3"
+                placeholder="${state.langMode === 'ja' ? 'ここにチームの感想を入力してください...' : '請在此輸入小隊的參訪心得與感想 / ここに感想を入力...'}"
+                class="w-full p-3 rounded-xl border border-stone-300 bg-parchment/60 focus:outline-none focus:border-pink-700 text-sm leading-relaxed"
+              >${escapeHtml(p.reflection || '')}</textarea>
+              <button
+                onclick="saveMuseumReflection('${m.id}')"
+                class="w-full py-2.5 rounded-xl bg-pink-800 hover:bg-pink-900 text-white font-bold text-xs sm:text-sm shadow transition flex items-center justify-center gap-1.5"
+              >
+                <i class="fa-solid fa-paper-plane"></i>
+                <span>${p.reflection ? '更新心得並同步至教師後台 / 感想を更新する' : '送出心得並同步至教師後台 / 感想を送信する'}</span>
+              </button>
+            </div>
+          ` : ''}
 
           ${p.completed ? `
             <div class="bg-gradient-to-r from-forest to-emerald-800 text-white rounded-2xl p-4 shadow-lg text-center space-y-1">
@@ -1679,32 +1743,33 @@
     }
 
     function renderBagView() {
-      const { shards } = calculateStats();
+      const stats = calculateStats();
       return `
         <div class="space-y-4">
           <div class="bg-white rounded-2xl p-4 archival-shadow border border-stone-200">
-            <h2 class="text-lg font-black text-ink flex items-center gap-2">
-              <i class="fa-solid fa-suitcase text-brick"></i>
-              <span>時空碎片背包（已收集 ${shards}/${MUSEUMS.length}）</span>
-            </h2>
-            <p class="text-xs text-stone-500 mt-0.5">完成各館 4 題解謎與 1 題合照任務，即可解鎖該館專屬知識碎片與密語。</p>
+            ${biText('🎒 時空碎片背包（已收集 ' + stats.shards + ' / 7 枚）', '🎒 時空の欠片バッグ（収集数 ' + stats.shards + ' / 7 枚）', 'h2', 'font-black text-base text-brick', 'text-xs text-stone-500')}
+            <p class="text-xs text-stone-600 mt-1">完成每座博物館的 4 道謎題與 1 項打卡合照，即可點亮該館的專屬時空碎片與通關密語。</p>
           </div>
 
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
             ${MUSEUMS.map(m => {
-              const done = state.progress[m.id].completed;
+              const p = state.progress[m.id];
               return `
-                <div onclick="navigateTo('museum', '${m.id}')" class="cursor-pointer rounded-2xl p-4 border-2 transition ${done ? 'bg-white border-gold archival-shadow' : 'bg-stone-100/70 border-stone-200 opacity-75'}">
-                  <div class="flex items-center justify-between mb-2">
-                    <span class="w-10 h-10 rounded-xl ${done ? m.color : 'bg-stone-400'} text-white flex items-center justify-center text-lg">
-                      <i class="fa-solid ${done ? 'fa-gem' : 'fa-lock'}"></i>
-                    </span>
-                    <span class="font-mono text-xs font-bold px-2.5 py-1 rounded-lg ${done ? 'bg-forest text-white' : 'bg-stone-200 text-stone-500'}">
-                      ${done ? m.code : 'LOCKED'}
-                    </span>
+                <div onclick="navigateTo('museum', '${m.id}')" class="rounded-2xl p-4 border-2 cursor-pointer transition ${p.completed ? 'bg-white border-gold archival-shadow' : 'bg-stone-100/80 border-stone-200 opacity-75'}">
+                  <div class="flex items-center gap-3">
+                    <div class="w-12 h-12 rounded-2xl ${p.completed ? m.color + ' text-white' : 'bg-stone-300 text-stone-500'} flex items-center justify-center text-xl shrink-0">
+                      <i class="fa-solid ${p.completed ? m.icon : 'fa-lock'}"></i>
+                    </div>
+                    <div>
+                      <div class="text-xs font-bold text-stone-500">${m.titleZh.replace('國立臺灣大學', '').replace('臺大醫學院', '').replace('臺大', '')}</div>
+                      <div class="font-black text-sm ${p.completed ? 'text-ink' : 'text-stone-400'}">
+                        ${p.completed ? `${m.shardNameZh} / ${m.shardNameJa}` : '尚未解鎖碎片'}
+                      </div>
+                      <div class="text-[11px] font-mono mt-0.5 ${p.completed ? 'text-brick font-bold' : 'text-stone-400'}">
+                        ${p.completed ? `密語：${m.code}` : '完成 4 題 + 合照解鎖'}
+                      </div>
+                    </div>
                   </div>
-                  <div class="font-black text-sm text-ink">${done ? `${m.shardNameZh}（${m.shardNameJa}）` : '尚未解鎖碎片'}</div>
-                  <div class="text-xs text-stone-500 mt-0.5">${m.titleZh}</div>
                 </div>
               `;
             }).join('')}
@@ -1714,110 +1779,91 @@
     }
 
     function renderCertificateView() {
-      const { score, shards, maxScore } = calculateStats();
+      const stats = calculateStats();
       const photos = MUSEUMS.filter(m => state.progress[m.id].photoData);
-      const today = new Date().toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
 
       return `
         <div class="space-y-4">
-          <div class="bg-parchment border-4 border-double border-gold rounded-2xl p-5 sm:p-6 shadow-xl relative overflow-hidden">
-            <div class="text-center border-b-2 border-stone-300 pb-4">
-              <div class="text-xs font-bold tracking-widest text-brick uppercase">NTU MUSEUMS EXPEDITION</div>
-              <h2 class="text-xl sm:text-2xl font-black text-ink mt-1">台大博物館群探索・通關認證書</h2>
-              <p class="text-xs text-stone-600 mt-0.5">台湾大学博物館群・台日交流フィールドワーク修了証</p>
-            </div>
-
-            <div class="my-4 space-y-2.5 text-sm">
-              <div class="flex justify-between py-1 border-b border-stone-200">
-                <span class="text-stone-500">探索小隊 / チーム名：</span>
-                <strong class="text-ink">${state.teamName || '（尚未設定隊名）'}（上午 ${state.morningGroup} 組）</strong>
-              </div>
-              <div class="flex justify-between py-1 border-b border-stone-200">
-                <span class="text-stone-500">通關場館數 / 達成館数：</span>
-                <strong class="text-brick">${shards} / ${MUSEUMS.length} 館</strong>
-              </div>
-              <div class="flex justify-between py-1 border-b border-stone-200">
-                <span class="text-stone-500">總累積積分 / 合計スコア：</span>
-                <strong class="text-forest text-lg">${score} / ${maxScore} 分</strong>
-              </div>
-              <div class="flex justify-between py-1 border-b border-stone-200">
-                <span class="text-stone-500">認證日期 / 実施日：</span>
-                <span class="font-mono text-stone-700">${today}</span>
-              </div>
-            </div>
-
-            <div class="bg-white rounded-xl p-3 border border-stone-200 mb-4">
-              <div class="text-xs font-bold text-stone-500 mb-2">已破譯通關密語清單（向老師出示此畫面核對）：</div>
-              <div class="flex flex-wrap gap-1.5">
-                ${MUSEUMS.map(m => {
-                  const done = state.progress[m.id].completed;
-                  return `
-                    <span class="px-2 py-1 rounded text-xs font-mono font-bold ${done ? 'bg-forest text-white' : 'bg-stone-100 text-stone-400'}">
-                      ${m.titleZh.slice(0, 2)}: ${done ? m.code : '????'}
-                    </span>
-                  `;
-                }).join('')}
-              </div>
-            </div>
-
+          <div class="bg-parchment border-4 border-double border-gold rounded-3xl p-5 sm:p-6 archival-shadow text-center space-y-4 relative overflow-hidden">
+            <div class="text-xs font-bold tracking-[0.25em] text-brick uppercase">NATIONAL TAIWAN UNIVERSITY MUSEUMS</div>
             <div>
-              <div class="text-xs font-bold text-stone-600 mb-2">
-                <i class="fa-solid fa-images text-brick mr-1"></i>本組田野打卡紀念牆 (${photos.length}/${MUSEUMS.length} 張)：
+              <h2 class="text-xl sm:text-2xl font-black text-ink">台日青年文化交流・實境探索證書</h2>
+              <p class="text-xs text-stone-600 mt-0.5">日台青年文化交流・台湾大学博物館群リアル探索認定証</p>
+            </div>
+
+            <div class="py-3 px-4 rounded-2xl bg-white/90 border border-gold/60 inline-block min-w-[240px]">
+              <div class="text-[11px] text-stone-500">探索小隊 / チーム名</div>
+              <div class="text-lg sm:text-xl font-black text-brick mt-0.5">${state.teamName ? escapeHtml(state.teamName) : '尚未設定小隊名稱'}</div>
+            </div>
+
+            <div class="grid grid-cols-2 gap-3 max-w-sm mx-auto">
+              <div class="bg-white rounded-2xl p-3 border border-stone-200">
+                <div class="text-xs text-stone-500">總積分 / 合計スコア</div>
+                <div class="text-2xl font-black text-brick">${stats.score} <span class="text-xs font-normal">/ 77</span></div>
               </div>
-              ${photos.length > 0 ? `
-                <div class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              <div class="bg-white rounded-2xl p-3 border border-stone-200">
+                <div class="text-xs text-stone-500">時空碎片 / 獲得欠片</div>
+                <div class="text-2xl font-black text-forest">${stats.shards} <span class="text-xs font-normal">/ 7</span></div>
+              </div>
+            </div>
+
+            ${photos.length > 0 ? `
+              <div class="pt-2 text-left">
+                <div class="text-xs font-bold text-stone-600 mb-2 text-center">📸 小隊探索足跡合照集（點擊放大）</div>
+                <div class="grid grid-cols-3 gap-2">
                   ${photos.map(m => `
-                    <div onclick="openPhotoZoom('${state.progress[m.id].photoData}', '${m.titleZh}')" class="cursor-pointer rounded-lg overflow-hidden border border-stone-300 bg-white shadow-sm">
-                      <img src="${state.progress[m.id].photoData}" class="w-full h-24 object-cover" />
-                      <div class="text-[10px] font-bold text-center py-1 bg-paper truncate px-1">${m.titleZh}</div>
-                    </div>
+                    <img src="${state.progress[m.id].photoData}" onclick="openPhotoZoom('${state.progress[m.id].photoData}', '${m.titleZh}')" class="w-full h-20 object-cover rounded-xl border border-stone-300 cursor-pointer" />
                   `).join('')}
                 </div>
-              ` : `
-                <div class="text-center py-6 bg-white/60 rounded-xl border border-dashed border-stone-300 text-xs text-stone-400">
-                  尚未上傳任何場館合照，快去各館完成第 5 題打卡任務吧！
-                </div>
-              `}
+              </div>
+            ` : `
+              <p class="text-xs text-stone-500">完成各館拍照打卡後，合照將自動彙整於此證書中！</p>
+            `}
+
+            <div class="pt-2 text-[11px] text-stone-500">
+              國立臺灣大學博物館群跨文化實境探索計畫
             </div>
           </div>
         </div>
       `;
     }
 
-    function unlockTeacherView() {
-      const inputEl = document.getElementById('teacher-pwd-input');
-      const val = normalizeInput(inputEl ? inputEl.value : '');
-      if (val === '20270304') {
-        state.teacherAuthenticated = true;
-        playChime(true);
-        showToast('教師驗證成功！已解鎖教師攻略', '教員認証に成功しました', 'success');
-        fetchAllTeamsFromCloud(false);
-        startTeacherAutoPoll();
-        render();
-      } else {
-        playChime(false);
-        showToast('密碼錯誤，請重新輸入！', 'パスワードが違います', 'error');
-        if (inputEl) {
-          inputEl.value = '';
-          inputEl.focus();
-        }
+    function renderTeacherView() {
+      if (!state.teacherAuthenticated) {
+        return `
+          <div class="max-w-md mx-auto mt-6 bg-white rounded-2xl p-6 archival-shadow border-2 border-gold text-center space-y-4">
+            <div class="w-14 h-14 rounded-full bg-brick/10 text-brick flex items-center justify-center text-2xl mx-auto">
+              <i class="fa-solid fa-lock"></i>
+            </div>
+            <div>
+              <h2 class="text-lg font-black text-ink">教師攻略與即時戰情室</h2>
+              <p class="text-xs text-stone-500 mt-1">此區包含各館標準答案與所有小隊即時積分後台，請輸入教師密碼解鎖。</p>
+            </div>
+            <div class="space-y-3">
+              <input
+                type="password"
+                id="teacher-pass-input"
+                inputmode="numeric"
+                onkeydown="if(event.key==='Enter') unlockTeacher()"
+                placeholder="請輸入教師密碼"
+                class="w-full px-4 py-3 rounded-xl border border-stone-300 text-center text-lg tracking-widest focus:outline-none focus:border-brick"
+              />
+              <button onclick="unlockTeacher()" class="w-full py-3 rounded-xl bg-brick hover:bg-brickDark text-white font-bold shadow transition">
+                解鎖進入 / ロック解除
+              </button>
+            </div>
+          </div>
+        `;
       }
-    }
 
-    function lockTeacherView() {
-      state.teacherAuthenticated = false;
-      stopTeacherAutoPoll();
-      showToast('已重新鎖定教師攻略', '教員ガイドをロックしました', 'info');
-      render();
-    }
-
-    function getTeamsBoardList() {
+      // Merge cloud teams with current device's local team if ahead
+      const stats = calculateStats();
       const map = new Map();
       state.allTeamsBoard.forEach(t => {
-        if (t && t.teamName) map.set(t.teamName.trim(), t);
+        if (t && t.teamName) map.set(t.teamName, t);
       });
+
       if (state.teamName.trim()) {
-        const stats = calculateStats();
         const photos = {};
         MUSEUMS.forEach(m => {
           if (state.progress[m.id].photoData) photos[m.id] = state.progress[m.id].photoData;
@@ -1829,112 +1875,87 @@
           shards: stats.shards,
           completedIds: MUSEUMS.filter(m => state.progress[m.id].completed).map(m => m.id),
           photos: photos,
+          anatomyReflection: (state.progress.anatomy && state.progress.anatomy.reflection) || '',
           updatedAt: '本機最新'
         };
         if (!map.has(localEntry.teamName) || (map.get(localEntry.teamName).score || 0) <= localEntry.score) {
           map.set(localEntry.teamName, localEntry);
         }
       }
-      return Array.from(map.values()).sort((a, b) => (b.score || 0) - (a.score || 0));
-    }
 
-    function renderTeacherView() {
-      if (!state.teacherAuthenticated) {
-        return `
-          <div class="max-w-md mx-auto mt-6 bg-white rounded-2xl p-6 archival-shadow border-2 border-slate-300 text-center space-y-4">
-            <div class="w-16 h-16 rounded-full bg-slate-800 text-goldLight flex items-center justify-center text-2xl mx-auto shadow-md">
-              <i class="fa-solid fa-lock"></i>
-            </div>
-            <div>
-              <h2 class="text-xl font-black text-ink">帶隊教師專區・密碼驗證</h2>
-              <p class="text-xs text-stone-500 mt-1">引率教員専用ページ・パスワードを入力してください</p>
-            </div>
-            <div class="space-y-3 pt-2">
-              <input
-                type="password"
-                inputmode="numeric"
-                id="teacher-pwd-input"
-                placeholder="請輸入教師密碼 / パスワード"
-                onkeydown="if(event.key==='Enter') unlockTeacherView()"
-                class="w-full px-4 py-3 rounded-xl border border-stone-300 bg-parchment/60 text-center text-lg tracking-widest font-mono focus:outline-none focus:border-brick"
-              />
-              <button
-                onclick="unlockTeacherView()"
-                class="w-full py-3 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-bold text-sm shadow transition flex items-center justify-center gap-2"
-              >
-                <i class="fa-solid fa-key text-goldLight"></i>
-                <span>驗證並進入 / ロック解除</span>
-              </button>
-            </div>
-          </div>
-        `;
-      }
-
-      const teams = getTeamsBoardList();
+      const sortedTeams = Array.from(map.values()).sort((a, b) => (b.score || 0) - (a.score || 0));
 
       return `
         <div class="space-y-4">
-          <div class="bg-slate-800 text-white rounded-2xl p-4 sm:p-5 shadow-lg">
-            <div class="flex items-center justify-between gap-2 mb-1">
-              <div class="flex items-center gap-2 text-goldLight text-xs font-bold">
-                <i class="fa-solid fa-shield-halved"></i>
-                <span>帶隊教師專用隨身手冊 / 引率教員用ガイド</span>
+          <!-- War Room Header -->
+          <div class="bg-ink text-white rounded-2xl p-4 archival-shadow flex items-center justify-between gap-2">
+            <div>
+              <h2 class="font-black text-base text-goldLight flex items-center gap-2">
+                <i class="fa-solid fa-satellite-dish"></i>
+                <span>教師即時戰情室與標準答案</span>
+              </h2>
+              <div class="text-xs mt-1 ${cloudConnected ? 'text-emerald-300' : 'text-rose-300'}">
+                <i class="fa-solid ${cloudConnected ? 'fa-circle-check' : 'fa-triangle-exclamation'} mr-1"></i>${cloudStatusText}
               </div>
-              <button onclick="lockTeacherView()" class="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-xs text-slate-200 font-bold transition flex items-center gap-1">
-                <i class="fa-solid fa-lock"></i>
-                <span>上鎖</span>
+              ${cloudErrorMsg ? `<div class="text-[11px] text-rose-300 mt-0.5">連線受阻：${escapeHtml(cloudErrorMsg)}</div>` : ''}
+            </div>
+            <div class="flex items-center gap-1.5 shrink-0">
+              <button onclick="fetchAllTeamsFromCloud(true)" class="px-2.5 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold">
+                <i class="fa-solid fa-rotate mr-1"></i>刷新
+              </button>
+              <button onclick="lockTeacher()" class="px-2.5 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-white text-xs font-bold">
+                <i class="fa-solid fa-lock mr-1"></i>上鎖
               </button>
             </div>
-            <h2 class="text-lg sm:text-xl font-bold">即時戰情室、七館標準答案與 20 人分流指南</h2>
-            <p class="text-xs text-slate-300 mt-1">已升級為「雲端直連引擎」，支援 Google 協作平台內嵌跨裝置同步（每 8 秒自動刷新）。</p>
           </div>
 
-          <!-- Live War Room Leaderboard -->
+          <!-- Live Leaderboard -->
           <div class="bg-white rounded-2xl p-4 archival-shadow border border-stone-200 space-y-3">
-            <div class="flex items-center justify-between">
-              <div>
-                <h3 class="font-bold text-sm text-brick flex items-center gap-1.5">
-                  <i class="fa-solid fa-trophy text-gold"></i>
-                  <span>跨裝置即時戰情室・各組積分看板</span>
-                </h3>
-                <p class="text-[11px] ${cloudConnected ? 'text-emerald-700' : 'text-amber-700'} font-medium mt-0.5">
-                  <i class="fa-solid fa-cloud-arrow-up mr-1"></i>${cloudStatusText}
-                </p>
-                ${cloudErrorMsg ? `<p class="text-[11px] text-rose-600 font-bold mt-0.5"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${cloudErrorMsg}</p>` : ''}
-              </div>
-              <button onclick="fetchAllTeamsFromCloud(true)" class="px-2.5 py-1 rounded-lg bg-parchment hover:bg-goldLight/40 border border-stone-300 text-xs font-bold text-ink shrink-0">
-                <i class="fa-solid fa-rotate mr-1"></i>立即刷新
-              </button>
-            </div>
-            ${teams.length > 0 ? `
+            <h3 class="font-black text-sm text-brick flex items-center justify-between">
+              <span><i class="fa-solid fa-ranking-star mr-1"></i>各小隊雲端即時進度排行榜</span>
+              <span class="text-xs font-normal text-stone-500">每 8 秒自動同步</span>
+            </h3>
+
+            ${sortedTeams.length > 0 ? `
               <div class="space-y-2.5">
-                ${teams.map((t, idx) => `
+                ${sortedTeams.map((t, idx) => `
                   <div class="p-3 rounded-xl bg-parchment/70 border border-stone-200 space-y-2">
                     <div class="flex items-center justify-between">
-                      <div class="font-bold text-sm text-ink">
-                        <span class="inline-block w-5 text-brick">#${idx + 1}</span>
-                        ${t.teamName} <span class="text-xs font-normal text-stone-500">(${t.morningGroup}組)</span>
+                      <div class="flex items-center gap-2">
+                        <span class="w-6 h-6 rounded-full ${idx === 0 ? 'bg-gold text-ink' : 'bg-stone-700 text-white'} text-xs font-black flex items-center justify-center">${idx + 1}</span>
+                        <span class="font-black text-sm text-ink">${escapeHtml(t.teamName)}</span>
+                        <span class="text-[11px] px-1.5 py-0.5 rounded bg-stone-200 text-stone-700 font-bold">${escapeHtml(t.morningGroup || 'A')}組</span>
                       </div>
                       <div class="text-right">
-                        <span class="font-black text-forest text-sm">${t.score} 分</span>
-                        <span class="text-[11px] text-stone-400 ml-1">(${t.shards}/7館)</span>
+                        <span class="font-black text-brick text-sm">${t.score || 0} pts</span>
+                        <span class="text-xs text-forest font-bold ml-1.5">(${t.shards || 0}/7館)</span>
                       </div>
                     </div>
+
                     <div class="flex flex-wrap gap-1">
                       ${MUSEUMS.map(m => {
-                        const done = t.completedIds && t.completedIds.includes(m.id);
-                        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${done ? 'bg-forest text-white' : 'bg-stone-200 text-stone-500'}">${m.titleZh.slice(0, 2)}</span>`;
+                        const done = (t.completedIds || []).includes(m.id);
+                        return `<span class="text-[10px] px-1.5 py-0.5 rounded font-bold ${done ? 'bg-emerald-600 text-white' : 'bg-stone-200 text-stone-500'}">${m.titleZh.replace('國立臺灣大學', '').replace('臺大醫學院', '').replace('臺大', '').slice(0, 3)}</span>`;
                       }).join('')}
                     </div>
+
                     ${t.photos && Object.keys(t.photos).length > 0 ? `
                       <div class="flex gap-1.5 overflow-x-auto pt-1">
                         ${Object.entries(t.photos).map(([mId, src]) => {
                           const mObj = MUSEUMS.find(x => x.id === mId);
-                          return `<img src="${src}" onclick="openPhotoZoom('${src}', '${t.teamName} - ${mObj ? mObj.titleZh : ''}')" class="w-14 h-14 rounded-lg object-cover border border-stone-300 cursor-pointer shrink-0" />`;
+                          return `<img src="${src}" onclick="openPhotoZoom('${src}', '${escapeHtml(t.teamName)} - ${mObj ? mObj.titleZh : ''}')" class="w-14 h-14 rounded-lg object-cover border border-stone-300 cursor-pointer shrink-0" />`;
                         }).join('')}
                       </div>
                     ` : ''}
-                    ${t.updatedAt ? `<div class="text-[10px] text-stone-400 text-right">最後更新：${t.updatedAt}</div>` : ''}
+
+                    ${t.anatomyReflection ? `
+                      <div class="p-2.5 rounded-lg bg-pink-50/90 border border-pink-200 text-xs text-ink leading-relaxed">
+                        <div class="font-bold text-pink-800 mb-0.5"><i class="fa-solid fa-comment-dots mr-1"></i>解剖館心得與感想：</div>
+                        <div class="whitespace-pre-wrap text-stone-700">${escapeHtml(t.anatomyReflection)}</div>
+                      </div>
+                    ` : ''}
+
+                    ${t.updatedAt ? `<div class="text-[10px] text-stone-400 text-right">最後更新：${escapeHtml(t.updatedAt)}</div>` : ''}
                   </div>
                 `).join('')}
               </div>
